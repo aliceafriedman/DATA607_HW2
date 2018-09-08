@@ -1,0 +1,180 @@
+---
+title: "Movie Preference Database"
+auhor: Alice Friedman
+date: September 10, 2018
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+remove(list = ls())
+```
+
+##Step 1: Load CSV
+I collected information on my friends' preferences using a Google form, so was then able to download a CSV with the responses preloaded.
+```{r}
+#avoid filepath shenanigans by using file.choose(), (does not knit)
+#f <- file.choose()
+#df <- read.csv(f,header=TRUE,sep=",")
+
+```
+
+```{r}
+df <- read.csv("/Users/alice/Documents/movies.csv",header=TRUE,sep=",")
+```
+##Step 2: Normalize data
+```{r}
+require(reshape2)
+```
+One table, "friends", deals only with who answered the question
+```{r}
+emails <- df[,2]
+emails
+friendsid <- c(1:length(emails))
+friends <- data.frame(friendsid, emails)
+friends
+```
+One table, "movies", is a list of the movies ranked
+```{r}
+remove(movie.names,moviesid,movies)
+titles <- colnames(df[3:8])
+moviesid <- c(1:length(titles))
+movies <- data.frame(moviesid, titles)
+movies
+```
+A third matching table will contain the rank, friend, and movie information
+```{r}
+rank.melt <- melt(df[2:8], id="Username")
+rankid <- c(1:length(rank.melt$variable))
+rank <- data.frame(rankid,rank.melt)
+colnames(rank)[3] <- "titles"
+rank
+```
+##Step 3: Setup SQLite, establish database connection
+```{r}
+require(DBI)
+# Create an RSQLite database
+mydb <- dbConnect(RSQLite::SQLite(), "my-db.sqlite")
+```
+##Step 4: Write tables to SQLite database
+```{r}
+dbWriteTable(mydb, "rank", rank, overwrite=TRUE)
+dbWriteTable(mydb, "friends", friends, overwrite=TRUE)
+dbWriteTable(mydb,"movies",movies, overwrite=TRUE)
+dbListTables(mydb)
+```
+##Step 6: Using SQL, clean data
+
+```{r}
+dbSendQuery(mydb, "UPDATE rank SET value='1' WHERE value='1 (Best)';")
+dbSendQuery(mydb, "UPDATE rank SET value='6' WHERE value='6 (Worst)';")
+dbGetQuery(mydb, "Select * FROM rank ORDER BY Username, value;")
+```
+
+##Step 7: Establish constraints using primary and foreign keys
+Note: SQLite automatially generates a row called "rowid" which acts as an autoincrement primary key, so the added ID colummns are not strictly necessary. It might be good to set your own primary keys if you want to enforce cascading updates.
+
+It is not possible to set a primary key or foreign in SQLite to an existing table, so the following is a workaround to enforce relationships between the imported tables as a workaround.
+
+```{r}
+dbSendStatement(mydb, "ALTER TABLE friends RENAME TO old_friends;")
+dbSendStatement(mydb,"CREATE TABLE friends (
+                      friendsid INTERGER NOT NULL, 
+                      Username TEXT NOT NULL PRIMARY KEY);")
+dbSendStatement(mydb, "INSERT INTO friends SELECT * FROM old_friends;")
+dbSendStatement(mydb, "DROP TABLE old_friends;")
+dbGetQuery(mydb,"Select * FROM friends;")
+```
+
+```{r}
+dbSendStatement(mydb, "ALTER TABLE movies RENAME TO old_movies;")
+dbSendStatement(mydb,"CREATE TABLE movies (
+                      moviesid INTERGER NOT NULL, 
+                      titles TEXT NOT NULL PRIMARY KEY
+                      );"
+			  )
+dbSendStatement(mydb, "INSERT INTO movies SELECT * FROM old_movies;")
+dbSendStatement(mydb, "DROP TABLE old_movies;")
+dbGetQuery(mydb,"Select * FROM movies;")
+```
+
+
+```{r}
+dbSendStatement(mydb, "ALTER TABLE rank RENAME TO old_rank;")
+dbSendStatement(mydb,"CREATE TABLE rank (
+                      rankid INTERGER NOT NULL PRIMARY KEY, 
+                      Username TEXT NOT NULL,
+                      titles TEXT NOT NULL,
+                      value TEXT NOT NULL,
+                      FOREIGN KEY (titles) REFERENCES movies (titles) 
+                        ON DELETE CASCADE ON UPDATE CASCADE,
+                      FOREIGN KEY (Username) REFERENCES friends (Username) 
+                        ON DELETE CASCADE ON UPDATE CASCADE
+                      );"
+)
+#Note: New columns names must be in same order as old column names for this to copy correctly
+dbSendStatement(mydb, "INSERT INTO rank SELECT * FROM old_rank;")
+dbSendStatement(mydb, "DROP TABLE old_rank;")
+dbGetQuery(mydb,"Select * FROM rank;")
+```
+
+The value of this is that we can now update the email addresses or movie titles in their respective tables and the results will cascade to the rank table. (Note: This will only work if the foreign key is a primary key in the parent table.)
+
+We can also add additional informaiton to the movies or friends tables that is not strictly related to the rank, e.g. release date or first and last names. 
+
+
+```{r}
+#Statement needed to turn foreign keys constraint on
+dbSendStatement(mydb, "PRAGMA foreign_keys = ON;")
+
+dbSendStatement(mydb, "UPDATE movies SET titles='Black Panther' WHERE titles='Black.Panther';")
+dbSendStatement(mydb, "UPDATE movies SET titles='I, Tonya' WHERE titles='I..Tonya';")
+dbSendStatement(mydb, "UPDATE movies SET titles='Back to the Future' WHERE titles='Back.to.the.Future';")
+dbSendStatement(mydb, "UPDATE movies SET titles='What About Bob?' WHERE titles='What.About.Bob';")
+dbGetQuery(mydb, "SELECT titles FROM rank GROUP BY titles;")
+#Note tht we updated movies, but saw the changes in rank. Pretty cool!
+```
+
+##Step 8: Explore results in SQL
+```{r}
+#What's the movie wiht the highest-ranked composite score?
+best_average_rank <- "SELECT titles, AVG(value) FROM rank GROUP BY titles ORDER BY AVG(value) LIMIT 1;"
+dbGetQuery(mydb,best_average_rank)
+
+#Which the movie have the most number one rankings?
+most_number_one_ranks <- "SELECT titles, COUNT(value) AS 'Number One Rankings' FROM rank WHERE value==1 GROUP BY titles HAVING value==1 ORDER BY COUNT(value) DESC;"
+dbGetQuery(mydb,most_number_one_ranks)
+
+#Which the movie have the most number 6 (worst) rankings?
+most_worst_ranks <- "SELECT titles, COUNT(value) AS 'Count Ranked as Worst' FROM rank WHERE value==6 GROUP BY titles HAVING value==6 ORDER BY COUNT(value) DESC;"
+dbGetQuery(mydb,most_worst_ranks)
+
+#:Note: What About Bob? is a GREAT movie. These rankings are a travesty.
+```
+
+
+##Step 9: Import into R dataframe
+
+```{r}
+rank <- dbGetQuery(mydb, "SELECT * FROM rank;")
+movies <- dbGetQuery(mydb, "SELECT * FROM movies;")
+friends <- dbGetQuery(mydb, "SELECT * FROM friends;")
+rank
+movies
+friends
+```
+
+##Step 10: Explore data in R, using "tidy"" data
+
+```{r}
+require("ggplot2")
+rank_sub <- rank[3:4]
+rank_long <- melt(table(rank_sub))
+colnames(rank_long) <- c("Title","Rank","Count")
+
+p <- ggplot(rank_long, aes(x=as.factor(Rank), y=Count)) + labs(x="Rank (1 is Best, 6 is Worst)")
+p + geom_bar(stat="identity", aes(fill=Title)) + facet_wrap(~Title)
+
+```
+
+
